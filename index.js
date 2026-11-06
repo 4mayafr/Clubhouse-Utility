@@ -9,7 +9,22 @@ const {
   PermissionFlagsBits,
   SlashCommandBuilder,
   MessageFlags,
+  EmbedBuilder,
 } = require('discord.js');
+
+/* ------------------------------ config ------------------------------- */
+
+// What users see instead of the staff member's name
+const STAFF_NAME = 'Staff Team';
+
+const COLORS = {
+  info: 0x5865f2, // blurple
+  ok: 0x57f287, // green
+  staff: 0x57f287,
+  user: 0xfee75c, // yellow
+  closed: 0xed4245, // red
+  error: 0xed4245,
+};
 
 /* ------------------------------ storage ------------------------------ */
 
@@ -41,16 +56,16 @@ const commands = [
     .setName('setup')
     .setDescription('Create the #usernames and #threads channels for tickets')
     .addRoleOption((o) =>
-      o.setName('staff-role').setDescription('Role that can see and use the ticket channels')
+      o
+        .setName('staff-role')
+        .setDescription('Role that can see the ticket channels and gets pinged on new tickets')
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
 
   new SlashCommandBuilder()
     .setName('create-ticket')
     .setDescription('Open a ticket thread and DM a server member through the bot')
-    .addUserOption((o) =>
-      o.setName('user').setDescription('Who to contact').setRequired(true)
-    )
+    .addUserOption((o) => o.setName('user').setDescription('Who to contact').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   new SlashCommandBuilder()
@@ -69,22 +84,52 @@ async function registerCommands(guild) {
 
 /* ------------------------------ helpers ------------------------------ */
 
-// Split long text into <=2000 char pieces for Discord
-function chunk(text, size = 1900) {
+function embed(description, { color = COLORS.info, title, author, footer, fields, image } = {}) {
+  const e = new EmbedBuilder().setColor(color).setTimestamp();
+  if (description) e.setDescription(description.slice(0, 4096));
+  if (title) e.setTitle(title);
+  if (author) e.setAuthor(author);
+  if (footer) e.setFooter(footer);
+  if (fields) e.addFields(fields);
+  if (image) e.setImage(image);
+  return e;
+}
+
+// Ephemeral/normal slash-command replies, always as embeds
+const replyEmbed = (interaction, description, color = COLORS.info, ephemeral = true) =>
+  interaction.reply({
+    embeds: [embed(description, { color })],
+    ...(ephemeral ? { flags: MessageFlags.Ephemeral } : {}),
+  });
+
+function chunk(text, size = 4000) {
   const out = [];
   for (let i = 0; i < text.length; i += size) out.push(text.slice(i, i + size));
   return out.length ? out : [''];
 }
 
-function withAttachments(message) {
-  const urls = [...message.attachments.values()].map((a) => a.url);
-  return [message.content, ...urls].filter(Boolean).join('\n');
+// Turns a Discord message (text + attachments) into one or more embeds
+function relayEmbeds(message, { author, color, footer }) {
+  const all = [...message.attachments.values()];
+  const image = all.find((a) => a.contentType?.startsWith('image/'));
+  const links = all.filter((a) => a !== image).map((a) => `[${a.name}](${a.url})`);
+
+  let text = message.content || '';
+  if (links.length) text += `${text ? '\n\n' : ''}${links.join('\n')}`;
+
+  const parts = chunk(text);
+  return parts.map((part, i) =>
+    embed(part, {
+      color,
+      author: i === 0 ? author : undefined,
+      footer: i === parts.length - 1 ? footer : undefined,
+      image: i === parts.length - 1 ? image?.url : undefined,
+    })
+  );
 }
 
-async function sendChunked(target, text) {
-  for (const part of chunk(text)) {
-    await target.send({ content: part, allowedMentions: { parse: [] } });
-  }
+async function sendEmbeds(target, embeds) {
+  for (const e of embeds) await target.send({ embeds: [e] });
 }
 
 function findOpenTicketByUser(userId, guildId) {
@@ -95,6 +140,74 @@ function findOpenTicketByUser(userId, guildId) {
   matches.sort((a, b) => b[1].createdAt - a[1].createdAt);
   const [threadId, ticket] = matches[0];
   return { threadId, ...ticket };
+}
+
+// First configured server the user is a member of
+async function pickGuildFor(userId) {
+  for (const guildId of Object.keys(db.guilds)) {
+    const guild = client.guilds.cache.get(guildId);
+    if (!guild) continue;
+    const member = await guild.members.fetch(userId).catch(() => null);
+    if (member) return guild;
+  }
+  return null;
+}
+
+/* ------------------------- ticket creation ---------------------------- */
+
+async function createTicket({ guild, user, openedBy = null, ping = false }) {
+  const cfg = db.guilds[guild.id];
+  const threadsChannel = await guild.channels.fetch(cfg.threadsChannelId);
+  const usernamesChannel = await guild.channels.fetch(cfg.usernamesChannelId);
+
+  const thread = await threadsChannel.threads.create({
+    name: `ticket-${user.username}`.slice(0, 100),
+    autoArchiveDuration: 10080, // 7 days
+    type: ChannelType.PublicThread, // public thread inside a staff-only channel
+    reason: openedBy ? `Ticket opened by ${openedBy.tag}` : `Ticket opened by ${user.tag} via DM`,
+  });
+
+  const logMsg = await usernamesChannel.send({
+    embeds: [
+      embed(null, {
+        title: 'Ticket opened',
+        color: COLORS.ok,
+        fields: [
+          { name: 'User', value: `${user.tag}\n\`${user.id}\``, inline: true },
+          { name: 'Thread', value: `${thread}`, inline: true },
+          { name: 'Opened by', value: openedBy ? `${openedBy}` : 'User (via DM)', inline: true },
+          { name: 'Status', value: 'Open', inline: true },
+        ],
+      }),
+    ],
+  });
+
+  db.tickets[thread.id] = {
+    userId: user.id,
+    guildId: guild.id,
+    logMessageId: logMsg.id,
+    createdAt: Date.now(),
+  };
+  save();
+
+  const rolePing = ping && cfg.staffRoleId ? `<@&${cfg.staffRoleId}>` : undefined;
+  await thread.send({
+    content: rolePing,
+    allowedMentions: { roles: rolePing ? [cfg.staffRoleId] : [] },
+    embeds: [
+      embed(
+        (openedBy
+          ? `Ticket opened with ${user} (\`${user.tag}\`) by ${openedBy}.`
+          : `${user} (\`${user.tag}\`) sent the bot a DM.`) +
+          `\n\nEverything you type here is sent to them anonymously as **${STAFF_NAME}**, ` +
+          `and their replies appear here.\n` +
+          `Start a message with \`//\` to keep it internal. Use \`/close-thread\` when you're done.`,
+        { title: 'Ticket', color: COLORS.info }
+      ),
+    ],
+  });
+
+  return thread;
 }
 
 /* ------------------------------ events ------------------------------- */
@@ -115,11 +228,11 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'close-thread') return await handleCloseThread(interaction);
   } catch (err) {
     console.error(err);
-    const msg = `Something went wrong: ${err.message}`;
+    const payload = { embeds: [embed(`Something went wrong: ${err.message}`, { color: COLORS.error })] };
     if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(msg).catch(() => {});
+      await interaction.editReply(payload).catch(() => {});
     } else {
-      await interaction.reply({ content: msg, flags: MessageFlags.Ephemeral }).catch(() => {});
+      await interaction.reply({ ...payload, flags: MessageFlags.Ephemeral }).catch(() => {});
     }
   }
 });
@@ -144,6 +257,8 @@ async function handleSetup(interaction) {
         PermissionFlagsBits.ManageThreads,
         PermissionFlagsBits.ReadMessageHistory,
         PermissionFlagsBits.AddReactions,
+        PermissionFlagsBits.EmbedLinks,
+        PermissionFlagsBits.MentionEveryone, // lets the bot ping the staff role
       ],
     },
   ];
@@ -177,101 +292,82 @@ async function handleSetup(interaction) {
     type: ChannelType.GuildText,
     parent: category.id,
     topic:
-      'One thread per ticket. Anything you type in a thread is sent to the user by DM. Start a message with // to keep it internal.',
+      'One thread per ticket. Anything you type in a thread is sent to the user anonymously. Start a message with // to keep it internal.',
   });
 
   db.guilds[guild.id] = {
     usernamesChannelId: usernamesChannel.id,
     threadsChannelId: threadsChannel.id,
+    staffRoleId: staffRole?.id ?? null,
   };
   save();
 
-  await interaction.editReply(
-    `Setup complete: ${usernamesChannel} and ${threadsChannel} created under **Tickets**.\n` +
-      `Use \`/create-ticket user:@someone\` to open a ticket.`
-  );
+  await interaction.editReply({
+    embeds: [
+      embed(
+        `${usernamesChannel} and ${threadsChannel} were created under **Tickets**.\n\n` +
+          `Anyone who DMs the bot now gets a ticket thread automatically. ` +
+          `You can also use \`/create-ticket user:@someone\` to reach out first.`,
+        { title: 'Setup complete', color: COLORS.ok }
+      ),
+    ],
+  });
 }
 
 /* ------------------------- /create-ticket ----------------------------- */
 
 async function handleCreateTicket(interaction) {
   const cfg = db.guilds[interaction.guildId];
-  if (!cfg) {
-    return interaction.reply({
-      content: 'Run `/setup` first so I can create the ticket channels.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
+  if (!cfg) return replyEmbed(interaction, 'Run `/setup` first so I can create the ticket channels.', COLORS.error);
 
   const target = interaction.options.getUser('user');
-  if (target.bot) {
-    return interaction.reply({ content: "I can't open tickets with bots.", flags: MessageFlags.Ephemeral });
-  }
+  if (target.bot) return replyEmbed(interaction, "I can't open tickets with bots.", COLORS.error);
 
   const existing = findOpenTicketByUser(target.id, interaction.guildId);
   if (existing) {
-    return interaction.reply({
-      content: `There's already an open ticket with ${target}: <#${existing.threadId}>`,
-      flags: MessageFlags.Ephemeral,
-    });
+    return replyEmbed(interaction, `There's already an open ticket with ${target}: <#${existing.threadId}>`, COLORS.error);
   }
 
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const threadsChannel = await interaction.guild.channels.fetch(cfg.threadsChannelId);
-  const usernamesChannel = await interaction.guild.channels.fetch(cfg.usernamesChannelId);
-
   // Try the DM first so we don't leave an orphan thread if their DMs are closed
   try {
-    await target.send(
-      `Hi ${target.username}, a member of the **${interaction.guild.name}** team would like to talk with you.\n` +
-        `You can reply right here and your messages will reach them.`
-    );
+    await target.send({
+      embeds: [
+        embed(
+          `The **${interaction.guild.name}** team would like to talk with you.\n` +
+            `You can reply right here and your messages will reach them.`,
+          {
+            author: { name: STAFF_NAME, iconURL: interaction.guild.iconURL() ?? undefined },
+            color: COLORS.staff,
+          }
+        ),
+      ],
+    });
   } catch {
-    return interaction.editReply(
-      `I couldn't DM ${target}. They probably have DMs from server members turned off.`
-    );
+    return interaction.editReply({
+      embeds: [
+        embed(`I couldn't DM ${target}. They probably have DMs from server members turned off.`, {
+          color: COLORS.error,
+        }),
+      ],
+    });
   }
 
-  const thread = await threadsChannel.threads.create({
-    name: `ticket-${target.username}`.slice(0, 100),
-    autoArchiveDuration: 10080, // 7 days
-    type: ChannelType.PublicThread, // public thread inside a staff-only channel
-    reason: `Ticket opened by ${interaction.user.tag}`,
+  const thread = await createTicket({
+    guild: interaction.guild,
+    user: target,
+    openedBy: interaction.user,
   });
 
-  const logMsg = await usernamesChannel.send({
-    content: `**${target.tag}** (\`${target.id}\`) - ${thread} - opened by ${interaction.user}`,
-    allowedMentions: { parse: [] },
-  });
-
-  db.tickets[thread.id] = {
-    userId: target.id,
-    guildId: interaction.guildId,
-    logMessageId: logMsg.id,
-    createdAt: Date.now(),
-  };
-  save();
-
-  await thread.send(
-    `Ticket opened with ${target} (\`${target.tag}\`) by ${interaction.user}.\n` +
-      `Everything you type here is sent to them by DM, and their replies show up here.\n` +
-      `Start a message with \`//\` to keep it internal. Use \`/close-thread\` when done.`
-  );
-
-  await interaction.editReply(`Ticket created: ${thread}`);
+  await interaction.editReply({ embeds: [embed(`Ticket created: ${thread}`, { color: COLORS.ok })] });
 }
 
 /* ------------------------- /close-thread ------------------------------ */
 
 async function handleCloseThread(interaction) {
   const ticket = db.tickets[interaction.channelId];
-  if (!ticket) {
-    return interaction.reply({
-      content: 'This command only works inside an open ticket thread.',
-      flags: MessageFlags.Ephemeral,
-    });
-  }
+  if (!ticket) return replyEmbed(interaction, 'This command only works inside an open ticket thread.', COLORS.error);
 
   await interaction.deferReply();
   const thread = interaction.channel;
@@ -279,10 +375,19 @@ async function handleCloseThread(interaction) {
   // Tell the user it's closed
   try {
     const user = await client.users.fetch(ticket.userId);
-    await user.send(
-      `Your ticket with **${interaction.guild.name}** has been closed. ` +
-        `If you need anything else, a staff member can open a new one.`
-    );
+    await user.send({
+      embeds: [
+        embed(
+          `Your ticket with **${interaction.guild.name}** has been closed.\n` +
+            `If you need anything else, just send me another message and a new ticket will be opened.`,
+          {
+            title: 'Ticket closed',
+            author: { name: STAFF_NAME, iconURL: interaction.guild.iconURL() ?? undefined },
+            color: COLORS.closed,
+          }
+        ),
+      ],
+    });
   } catch {
     /* user may have blocked the bot */
   }
@@ -293,7 +398,15 @@ async function handleCloseThread(interaction) {
     try {
       const ch = await interaction.guild.channels.fetch(cfg.usernamesChannelId);
       const msg = await ch.messages.fetch(ticket.logMessageId);
-      await msg.edit({ content: `~~${msg.content}~~ (closed)`, allowedMentions: { parse: [] } });
+      const e = EmbedBuilder.from(msg.embeds[0])
+        .setTitle('Ticket closed')
+        .setColor(COLORS.closed)
+        .setFields(
+          (msg.embeds[0].fields ?? []).map((f) =>
+            f.name === 'Status' ? { name: 'Status', value: `Closed by ${interaction.user}`, inline: true } : f
+          )
+        );
+      await msg.edit({ embeds: [e] });
     } catch {
       /* log message may have been deleted */
     }
@@ -302,52 +415,106 @@ async function handleCloseThread(interaction) {
   delete db.tickets[interaction.channelId];
   save();
 
-  await interaction.editReply(`Ticket closed by ${interaction.user}. This thread is now locked.`);
+  await interaction.editReply({
+    embeds: [embed(`Ticket closed by ${interaction.user}. This thread is now locked.`, { color: COLORS.closed })],
+  });
   await thread.setLocked(true).catch(() => {});
   await thread.setArchived(true).catch(() => {});
 }
 
 /* ------------------------- message relay ------------------------------ */
 
+// Prevents two quick DMs from creating two tickets
+const pendingTickets = new Map();
+
+async function getOrCreateTicket(user) {
+  const existing = findOpenTicketByUser(user.id);
+  if (existing) return existing;
+  if (pendingTickets.has(user.id)) return pendingTickets.get(user.id);
+
+  const promise = (async () => {
+    const guild = await pickGuildFor(user.id);
+    if (!guild) return null;
+
+    const thread = await createTicket({ guild, user, ping: true });
+    await user
+      .send({
+        embeds: [
+          embed(
+            `Your message has been sent to the **${guild.name}** team. ` +
+              `They'll reply here, and anything you send me will reach them.`,
+            { title: 'Ticket opened', color: COLORS.ok }
+          ),
+        ],
+      })
+      .catch(() => {});
+
+    return { threadId: thread.id, ...db.tickets[thread.id] };
+  })().finally(() => pendingTickets.delete(user.id));
+
+  pendingTickets.set(user.id, promise);
+  return promise;
+}
+
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
 
-  // Staff message in a ticket thread -> DM the user
+  // Staff message in a ticket thread -> DM the user, anonymously
   if (message.channel.isThread()) {
     const ticket = db.tickets[message.channel.id];
     if (!ticket) return;
     if (message.content.startsWith('//')) return; // internal note
-
-    const text = withAttachments(message);
-    if (!text) return;
+    if (!message.content && !message.attachments.size) return;
 
     try {
       const user = await client.users.fetch(ticket.userId);
-      const name = message.member?.displayName ?? message.author.username;
-      await sendChunked(user, `**${name}:** ${text}`);
+      const embeds = relayEmbeds(message, {
+        author: { name: STAFF_NAME, iconURL: message.guild.iconURL() ?? undefined },
+        color: COLORS.staff,
+        footer: { text: message.guild.name },
+      });
+      await sendEmbeds(user, embeds);
       await message.react('✅').catch(() => {});
     } catch {
       await message.react('❌').catch(() => {});
-      await message.reply("Couldn't deliver that. The user may have blocked me or closed their DMs.").catch(() => {});
+      await message.channel
+        .send({
+          embeds: [embed("Couldn't deliver that message. The user may have blocked me or closed their DMs.", { color: COLORS.error })],
+        })
+        .catch(() => {});
     }
     return;
   }
 
-  // User DM -> post into their ticket thread
+  // User DM -> find or create their ticket, then post into the thread
   if (message.channel.type === ChannelType.DM) {
-    const ticket = findOpenTicketByUser(message.author.id);
-    if (!ticket) return; // no open ticket, ignore
-
-    const text = withAttachments(message);
-    if (!text) return;
+    if (!message.content && !message.attachments.size) return;
 
     try {
+      const ticket = await getOrCreateTicket(message.author);
+      if (!ticket) {
+        return message.channel
+          .send({
+            embeds: [
+              embed("I couldn't find a server where tickets are set up for you, so I can't pass that on.", {
+                color: COLORS.error,
+              }),
+            ],
+          })
+          .catch(() => {});
+      }
+
       const thread = await client.channels.fetch(ticket.threadId);
       if (thread.archived) await thread.setArchived(false);
-      await sendChunked(thread, `**${message.author.username}:** ${text}`);
+
+      const embeds = relayEmbeds(message, {
+        author: { name: message.author.username, iconURL: message.author.displayAvatarURL() },
+        color: COLORS.user,
+      });
+      await sendEmbeds(thread, embeds);
       await message.react('✅').catch(() => {});
     } catch (err) {
-      console.error('Failed to relay DM:', err.message);
+      console.error('Failed to relay DM:', err);
       await message.react('❌').catch(() => {});
     }
   }
