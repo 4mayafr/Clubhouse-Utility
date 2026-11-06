@@ -29,12 +29,13 @@ const COLORS = {
 /* ------------------------------ storage ------------------------------ */
 
 const DATA_FILE = path.join(__dirname, 'data.json');
-let db = { guilds: {}, tickets: {} };
+let db = { guilds: {}, tickets: {}, links: {} };
 try {
   db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
 } catch {
   /* first run */
 }
+db.links ??= {}; // older data.json files won't have this yet
 const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
 
 /* ------------------------------ client ------------------------------- */
@@ -78,6 +79,22 @@ const commands = [
   new SlashCommandBuilder()
     .setName('close-thread')
     .setDescription('Close this ticket thread and stop relaying messages')
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  new SlashCommandBuilder()
+    .setName('link-meta')
+    .setDescription("Link a username to a user (inside a ticket thread it defaults to that ticket's user)")
+    .addStringOption((o) =>
+      o.setName('username').setDescription('The username to link').setRequired(true).setMaxLength(100)
+    )
+    .addUserOption((o) =>
+      o.setName('user').setDescription('Who to link it to (optional inside a ticket thread)')
+    )
+    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
+
+  new SlashCommandBuilder()
+    .setName('usernames')
+    .setDescription('Show every linked username')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 ].map((c) => c.toJSON());
 
@@ -183,6 +200,9 @@ async function createTicket({ guild, user, openedBy = null, ping = false, initia
           { name: 'User', value: `${user.tag}\n\`${user.id}\``, inline: true },
           { name: 'Thread', value: `${thread}`, inline: true },
           { name: 'Opened by', value: openedBy ? `${openedBy}` : 'User (via DM)', inline: true },
+          ...(db.links[guild.id]?.[user.id]
+            ? [{ name: 'Linked username', value: `\`${db.links[guild.id][user.id].username}\``, inline: true }]
+            : []),
           { name: 'Status', value: 'Open', inline: true },
         ],
       }),
@@ -246,6 +266,8 @@ client.on('interactionCreate', async (interaction) => {
     if (interaction.commandName === 'setup') return await handleSetup(interaction);
     if (interaction.commandName === 'create-ticket') return await handleCreateTicket(interaction);
     if (interaction.commandName === 'close-thread') return await handleCloseThread(interaction);
+    if (interaction.commandName === 'link-meta') return await handleLinkMeta(interaction);
+    if (interaction.commandName === 'usernames') return await handleUsernames(interaction);
   } catch (err) {
     console.error(err);
     const payload = { embeds: [embed(`Something went wrong: ${err.message}`, { color: COLORS.error })] };
@@ -442,6 +464,74 @@ async function handleCloseThread(interaction) {
   });
   await thread.setLocked(true).catch(() => {});
   await thread.setArchived(true).catch(() => {});
+}
+
+/* ---------------------- /link-meta & /usernames ------------------------ */
+
+async function handleLinkMeta(interaction) {
+  const username = interaction.options.getString('username', true).trim();
+  let target = interaction.options.getUser('user');
+
+  // Inside a ticket thread, default to that ticket's user
+  if (!target) {
+    const ticket = db.tickets[interaction.channelId];
+    if (ticket) target = await client.users.fetch(ticket.userId).catch(() => null);
+  }
+  if (!target) {
+    return replyEmbed(
+      interaction,
+      "Pick a `user`, or run this inside a ticket thread to link that ticket's user.",
+      COLORS.error
+    );
+  }
+
+  const links = (db.links[interaction.guildId] ??= {});
+  const updated = Boolean(links[target.id]);
+  links[target.id] = { username, linkedBy: interaction.user.id, linkedAt: Date.now() };
+  save();
+
+  return replyEmbed(
+    interaction,
+    `${target} (\`${target.tag}\`) is now linked to \`${username}\`.${updated ? ' (Replaced the previous username.)' : ''}`,
+    COLORS.ok
+  );
+}
+
+async function handleUsernames(interaction) {
+  const entries = Object.entries(db.links[interaction.guildId] ?? {});
+  if (!entries.length) {
+    return replyEmbed(interaction, 'No usernames linked yet. Use `/link-meta` to add one.');
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const lines = await Promise.all(
+    entries.map(async ([userId, link]) => {
+      const user = await client.users.fetch(userId).catch(() => null);
+      const who = user ? `${user} (${user.tag})` : `\`${userId}\``;
+      return `${who} → \`${link.username}\``;
+    })
+  );
+
+  // Split into pages so a long list never exceeds the embed limit
+  const pages = [];
+  let current = '';
+  for (const line of lines) {
+    if (current.length + line.length + 1 > 3900) {
+      pages.push(current);
+      current = '';
+    }
+    current += `${line}\n`;
+  }
+  if (current) pages.push(current);
+
+  const embeds = pages
+    .slice(0, 10)
+    .map((page, i) =>
+      embed(page, { title: i === 0 ? `Linked usernames (${entries.length})` : undefined, color: COLORS.info })
+    );
+
+  return interaction.editReply({ embeds });
 }
 
 /* ------------------------- message relay ------------------------------ */
