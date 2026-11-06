@@ -94,9 +94,18 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('usernames')
-    .setDescription('Show every linked username')
-    .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
-].map((c) => c.toJSON());
+    .setDescription('Show every linked username'),
+
+  new SlashCommandBuilder()
+    .setName('staff-role')
+    .setDescription('Set the staff role that can use the ticket commands and see the ticket channels')
+    .addRoleOption((o) => o.setName('role').setDescription('The staff role').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+]
+  .map((c) => c.toJSON())
+  // Only /setup and /staff-role are hidden from non-admins. The rest are visible to everyone
+  // and access is checked in code (see isStaff), so a staff role alone is enough.
+  .map((c) => (['setup', 'staff-role'].includes(c.name) ? c : { ...c, default_member_permissions: null }));
 
 async function registerCommands(guild) {
   try {
@@ -107,6 +116,17 @@ async function registerCommands(guild) {
 }
 
 /* ------------------------------ helpers ------------------------------ */
+
+// Staff = has the saved staff role, or Manage Messages / Administrator
+function isStaff(interaction) {
+  const member = interaction.member;
+  if (!member) return false;
+  const staffRoleId = db.guilds[interaction.guildId]?.staffRoleId;
+  return (
+    member.permissions.has(PermissionFlagsBits.ManageMessages) ||
+    Boolean(staffRoleId && member.roles.cache?.has(staffRoleId))
+  );
+}
 
 function embed(description, { color = COLORS.info, title, author, footer, fields, image } = {}) {
   const e = new EmbedBuilder().setColor(color).setTimestamp();
@@ -263,7 +283,11 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
+    if (!['setup', 'staff-role'].includes(interaction.commandName) && !isStaff(interaction)) {
+      return replyEmbed(interaction, "You don't have permission to use this command.", COLORS.error);
+    }
     if (interaction.commandName === 'setup') return await handleSetup(interaction);
+    if (interaction.commandName === 'staff-role') return await handleStaffRole(interaction);
     if (interaction.commandName === 'create-ticket') return await handleCreateTicket(interaction);
     if (interaction.commandName === 'close-thread') return await handleCloseThread(interaction);
     if (interaction.commandName === 'link-meta') return await handleLinkMeta(interaction);
@@ -464,6 +488,42 @@ async function handleCloseThread(interaction) {
   });
   await thread.setLocked(true).catch(() => {});
   await thread.setArchived(true).catch(() => {});
+}
+
+/* ---------------------------- /staff-role ------------------------------ */
+
+async function handleStaffRole(interaction) {
+  const cfg = db.guilds[interaction.guildId];
+  if (!cfg) return replyEmbed(interaction, 'Run `/setup` first so the ticket channels exist.', COLORS.error);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const role = interaction.options.getRole('role', true);
+
+  // Give the role access to the ticket category (the channels inside inherit it)
+  const threadsChannel = await interaction.guild.channels.fetch(cfg.threadsChannelId);
+  const usernamesChannel = await interaction.guild.channels.fetch(cfg.usernamesChannelId);
+  const targets = threadsChannel.parent ? [threadsChannel.parent] : [threadsChannel, usernamesChannel];
+  for (const target of targets) {
+    await target.permissionOverwrites.edit(role, {
+      ViewChannel: true,
+      SendMessages: true,
+      SendMessagesInThreads: true,
+      ReadMessageHistory: true,
+    });
+  }
+
+  cfg.staffRoleId = role.id;
+  save();
+
+  await interaction.editReply({
+    embeds: [
+      embed(
+        `${role} can now see ${usernamesChannel} and ${threadsChannel}, use the ticket commands, ` +
+          `and will be pinged on new tickets from DMs.`,
+        { title: 'Staff role set', color: COLORS.ok }
+      ),
+    ],
+  });
 }
 
 /* ---------------------- /link-meta & /usernames ------------------------ */
