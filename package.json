@@ -1,0 +1,16 @@
+{
+  "name": "ticket-dm-bot",
+  "version": "1.0.0",
+  "description": "Discord bot that relays staff messages in threads to a user's DMs and back",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.0",
+    "dotenv": "^16.4.5"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
