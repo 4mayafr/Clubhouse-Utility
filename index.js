@@ -66,6 +66,13 @@ const commands = [
     .setName('create-ticket')
     .setDescription('Open a ticket thread and DM a server member through the bot')
     .addUserOption((o) => o.setName('user').setDescription('Who to contact').setRequired(true))
+    .addStringOption((o) =>
+      o
+        .setName('message')
+        .setDescription('The first message to DM them (sent anonymously as Staff Team)')
+        .setRequired(true)
+        .setMaxLength(2000)
+    )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
   new SlashCommandBuilder()
@@ -155,7 +162,7 @@ async function pickGuildFor(userId) {
 
 /* ------------------------- ticket creation ---------------------------- */
 
-async function createTicket({ guild, user, openedBy = null, ping = false }) {
+async function createTicket({ guild, user, openedBy = null, ping = false, initialMessage = null }) {
   const cfg = db.guilds[guild.id];
   const threadsChannel = await guild.channels.fetch(cfg.threadsChannelId);
   const usernamesChannel = await guild.channels.fetch(cfg.usernamesChannelId);
@@ -206,6 +213,19 @@ async function createTicket({ guild, user, openedBy = null, ping = false }) {
       ),
     ],
   });
+
+  // Show staff exactly what was sent to the user
+  if (initialMessage) {
+    await thread.send({
+      embeds: [
+        embed(initialMessage, {
+          title: 'Initial message sent to user',
+          author: { name: STAFF_NAME, iconURL: guild.iconURL() ?? undefined },
+          color: COLORS.staff,
+        }),
+      ],
+    });
+  }
 
   return thread;
 }
@@ -321,6 +341,7 @@ async function handleCreateTicket(interaction) {
   if (!cfg) return replyEmbed(interaction, 'Run `/setup` first so I can create the ticket channels.', COLORS.error);
 
   const target = interaction.options.getUser('user');
+  const initialMessage = interaction.options.getString('message', true);
   if (target.bot) return replyEmbed(interaction, "I can't open tickets with bots.", COLORS.error);
 
   const existing = findOpenTicketByUser(target.id, interaction.guildId);
@@ -335,11 +356,11 @@ async function handleCreateTicket(interaction) {
     await target.send({
       embeds: [
         embed(
-          `The **${interaction.guild.name}** team would like to talk with you.\n` +
-            `You can reply right here and your messages will reach them.`,
+          initialMessage,
           {
             author: { name: STAFF_NAME, iconURL: interaction.guild.iconURL() ?? undefined },
             color: COLORS.staff,
+            footer: { text: `${interaction.guild.name} • Reply to this message to respond` },
           }
         ),
       ],
@@ -358,6 +379,7 @@ async function handleCreateTicket(interaction) {
     guild: interaction.guild,
     user: target,
     openedBy: interaction.user,
+    initialMessage,
   });
 
   await interaction.editReply({ embeds: [embed(`Ticket created: ${thread}`, { color: COLORS.ok })] });
