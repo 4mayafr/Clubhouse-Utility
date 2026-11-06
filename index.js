@@ -83,12 +83,12 @@ const commands = [
 
   new SlashCommandBuilder()
     .setName('link-meta')
-    .setDescription("Link a username to a user (inside a ticket thread it defaults to that ticket's user)")
+    .setDescription('Save a username, optionally linked to a user (works anywhere)')
     .addStringOption((o) =>
       o.setName('username').setDescription('The username to link').setRequired(true).setMaxLength(100)
     )
     .addUserOption((o) =>
-      o.setName('user').setDescription('Who to link it to (optional inside a ticket thread)')
+      o.setName('user').setDescription('Link it to this Discord user (optional)')
     )
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageMessages),
 
@@ -477,22 +477,18 @@ async function handleLinkMeta(interaction) {
     const ticket = db.tickets[interaction.channelId];
     if (ticket) target = await client.users.fetch(ticket.userId).catch(() => null);
   }
-  if (!target) {
-    return replyEmbed(
-      interaction,
-      "Pick a `user`, or run this inside a ticket thread to link that ticket's user.",
-      COLORS.error
-    );
-  }
-
+  // No user and not in a ticket thread: just save the username on its own
   const links = (db.links[interaction.guildId] ??= {});
-  const updated = Boolean(links[target.id]);
-  links[target.id] = { username, linkedBy: interaction.user.id, linkedAt: Date.now() };
+  const key = target ? target.id : `name:${username.toLowerCase()}`;
+  const updated = Boolean(links[key]);
+  links[key] = { username, userId: target?.id ?? null, linkedBy: interaction.user.id, linkedAt: Date.now() };
   save();
 
   return replyEmbed(
     interaction,
-    `${target} (\`${target.tag}\`) is now linked to \`${username}\`.${updated ? ' (Replaced the previous username.)' : ''}`,
+    target
+      ? `${target} (\`${target.tag}\`) is now linked to \`${username}\`.${updated ? ' (Replaced the previous username.)' : ''}`
+      : `Saved \`${username}\`.${updated ? ' (It was already saved.)' : ''}`,
     COLORS.ok
   );
 }
@@ -506,9 +502,11 @@ async function handleUsernames(interaction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
   const lines = await Promise.all(
-    entries.map(async ([userId, link]) => {
-      const user = await client.users.fetch(userId).catch(() => null);
-      const who = user ? `${user} (${user.tag})` : `\`${userId}\``;
+    entries.map(async ([key, link]) => {
+      // Standalone entries (no Discord user) are keyed "name:..."
+      if (key.startsWith('name:')) return `\`${link.username}\``;
+      const user = await client.users.fetch(key).catch(() => null);
+      const who = user ? `${user} (${user.tag})` : `\`${key}\``;
       return `${who} → \`${link.username}\``;
     })
   );
