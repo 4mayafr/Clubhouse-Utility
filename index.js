@@ -52,10 +52,13 @@ const client = new Client({
 
 /* ------------------------------ commands ----------------------------- */
 
+// Hidden from non-admins by Discord itself
+const ADMIN_COMMANDS = ['setup', 'staff-role', 'mod-role'];
+
 const commands = [
   new SlashCommandBuilder()
     .setName('setup')
-    .setDescription('Create the #usernames and #threads channels for tickets')
+    .setDescription('Create the #usernames, #threads and #ban-logs channels')
     .addRoleOption((o) =>
       o
         .setName('staff-role')
@@ -101,11 +104,38 @@ const commands = [
     .setDescription('Set the staff role that can use the ticket commands and see the ticket channels')
     .addRoleOption((o) => o.setName('role').setDescription('The staff role').setRequired(true))
     .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('mod-role')
+    .setDescription('Set the mod role that can use /log-ban and see the ban log channel')
+    .addRoleOption((o) => o.setName('role').setDescription('The mod role').setRequired(true))
+    .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+
+  new SlashCommandBuilder()
+    .setName('log-ban')
+    .setDescription('Log a ban to the ban log channel')
+    .addStringOption((o) =>
+      o
+        .setName('username')
+        .setDescription('The username of the banned player (not their Discord name)')
+        .setRequired(true)
+        .setMaxLength(100)
+    )
+    .addStringOption((o) =>
+      o
+        .setName('length')
+        .setDescription('How long the ban lasts, e.g. 7 days or permanent')
+        .setRequired(true)
+        .setMaxLength(100)
+    )
+    .addStringOption((o) =>
+      o.setName('reason').setDescription('Why they were banned').setRequired(true).setMaxLength(1000)
+    ),
 ]
   .map((c) => c.toJSON())
-  // Only /setup and /staff-role are hidden from non-admins. The rest are visible to everyone
-  // and access is checked in code (see isStaff), so a staff role alone is enough.
-  .map((c) => (['setup', 'staff-role'].includes(c.name) ? c : { ...c, default_member_permissions: null }));
+  // Only the admin commands are hidden from non-admins. The rest are visible to everyone
+  // and access is checked in code (see isStaff / isMod), so a role alone is enough.
+  .map((c) => (ADMIN_COMMANDS.includes(c.name) ? c : { ...c, default_member_permissions: null }));
 
 async function registerCommands(guild) {
   try {
@@ -126,6 +156,13 @@ function isStaff(interaction) {
     member.permissions.has(PermissionFlagsBits.ManageMessages) ||
     Boolean(staffRoleId && member.roles.cache?.has(staffRoleId))
   );
+}
+
+// Mod = staff, or has the saved mod role
+function isMod(interaction) {
+  if (isStaff(interaction)) return true;
+  const modRoleId = db.guilds[interaction.guildId]?.modRoleId;
+  return Boolean(modRoleId && interaction.member?.roles.cache?.has(modRoleId));
 }
 
 function embed(description, { color = COLORS.info, title, author, footer, fields, image } = {}) {
@@ -283,11 +320,16 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
 
   try {
-    if (!['setup', 'staff-role'].includes(interaction.commandName) && !isStaff(interaction)) {
-      return replyEmbed(interaction, "You don't have permission to use this command.", COLORS.error);
+    if (!ADMIN_COMMANDS.includes(interaction.commandName)) {
+      const allowed = interaction.commandName === 'log-ban' ? isMod(interaction) : isStaff(interaction);
+      if (!allowed) {
+        return replyEmbed(interaction, "You don't have permission to use this command.", COLORS.error);
+      }
     }
     if (interaction.commandName === 'setup') return await handleSetup(interaction);
     if (interaction.commandName === 'staff-role') return await handleStaffRole(interaction);
+    if (interaction.commandName === 'mod-role') return await handleModRole(interaction);
+    if (interaction.commandName === 'log-ban') return await handleLogBan(interaction);
     if (interaction.commandName === 'create-ticket') return await handleCreateTicket(interaction);
     if (interaction.commandName === 'close-thread') return await handleCloseThread(interaction);
     if (interaction.commandName === 'link-meta') return await handleLinkMeta(interaction);
@@ -361,17 +403,26 @@ async function handleSetup(interaction) {
       'One thread per ticket. Anything you type in a thread is sent to the user anonymously. Start a message with // to keep it internal.',
   });
 
+  const banLogsChannel = await guild.channels.create({
+    name: 'ban-logs',
+    type: ChannelType.GuildText,
+    parent: category.id,
+    topic: 'Every ban logged with /log-ban.',
+  });
+
   db.guilds[guild.id] = {
     usernamesChannelId: usernamesChannel.id,
     threadsChannelId: threadsChannel.id,
+    banLogChannelId: banLogsChannel.id,
     staffRoleId: staffRole?.id ?? null,
+    modRoleId: null,
   };
   save();
 
   await interaction.editReply({
     embeds: [
       embed(
-        `${usernamesChannel} and ${threadsChannel} were created under **Tickets**.\n\n` +
+        `${usernamesChannel}, ${threadsChannel} and ${banLogsChannel} were created under **Tickets**.\n\n` +
           `Anyone who DMs the bot now gets a ticket thread automatically. ` +
           `You can also use \`/create-ticket user:@someone\` to reach out first.`,
         { title: 'Setup complete', color: COLORS.ok }
@@ -554,42 +605,173 @@ async function handleLinkMeta(interaction) {
 }
 
 async function handleUsernames(interaction) {
-  const entries = Object.entries(db.links[interaction.guildId] ?? {});
-  if (!entries.length) {
-    return replyEmbed(interaction, 'No usernames linked yet. Use `/link-meta` to add one.');
-  }
-
+  // Defer first so a slow user lookup can never hit Discord's 3 second reply limit
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
 
-  const lines = await Promise.all(
-    entries.map(async ([key, link]) => {
-      // Standalone entries (no Discord user) are keyed "name:..."
-      if (key.startsWith('name:')) return `\`${link.username}\``;
-      const user = await client.users.fetch(key).catch(() => null);
-      const who = user ? `${user} (${user.tag})` : `\`${key}\``;
-      return `${who} → \`${link.username}\``;
-    })
-  );
+  const links = db.links[interaction.guildId] ?? {};
+  const entries = Object.entries(links);
+
+  // Everyone with an open ticket in this server, even if they have no username linked yet
+  const openTicketUserIds = [
+    ...new Set(
+      Object.values(db.tickets)
+        .filter((t) => t.guildId === interaction.guildId)
+        .map((t) => t.userId)
+    ),
+  ];
+
+  const describeUser = async (userId) => {
+    const user = await client.users.fetch(userId).catch(() => null);
+    return user ? `${user} (${user.username})` : `\`${userId}\``;
+  };
+
+  const lines = [];
+
+  // Linked usernames
+  for (const [key, link] of entries) {
+    const username = link?.username ?? '(unknown)';
+    // Standalone entries (no Discord user) are keyed "name:..."
+    if (key.startsWith('name:')) {
+      lines.push(`\`${username}\``);
+    } else {
+      lines.push(`${await describeUser(key)} → \`${username}\``);
+    }
+  }
+
+  // Open tickets that don't have a linked username yet
+  for (const userId of openTicketUserIds) {
+    if (links[userId]) continue;
+    lines.push(`${await describeUser(userId)} → *(no username linked, ticket open)*`);
+  }
+
+  if (!lines.length) {
+    return interaction.editReply({
+      embeds: [embed('No usernames saved yet. Use `/link-meta username:... user:@someone` to add one.')],
+    });
+  }
 
   // Split into pages so a long list never exceeds the embed limit
   const pages = [];
   let current = '';
   for (const line of lines) {
-    if (current.length + line.length + 1 > 3900) {
+    if (current && current.length + line.length + 1 > 3900) {
       pages.push(current);
       current = '';
     }
-    current += `${line}\n`;
+    current += `${line.slice(0, 3800)}\n`;
   }
   if (current) pages.push(current);
 
   const embeds = pages
     .slice(0, 10)
     .map((page, i) =>
-      embed(page, { title: i === 0 ? `Linked usernames (${entries.length})` : undefined, color: COLORS.info })
+      embed(page, { title: i === 0 ? `Usernames (${lines.length})` : undefined, color: COLORS.info })
     );
 
   return interaction.editReply({ embeds });
+}
+
+/* ----------------------- /mod-role & /log-ban ------------------------- */
+
+// Returns the ban log channel, recreating it if it was never made (servers set up before
+// this feature) or was deleted. It stays private: it inherits the Tickets category, or gets
+// explicit staff-only permissions if that category is gone.
+async function ensureBanLogChannel(guild) {
+  const cfg = db.guilds[guild.id];
+  if (!cfg) return null;
+
+  if (cfg.banLogChannelId) {
+    const existing = await guild.channels.fetch(cfg.banLogChannelId).catch(() => null);
+    if (existing) return existing;
+  }
+
+  const threadsChannel = await guild.channels.fetch(cfg.threadsChannelId).catch(() => null);
+  const parentId = threadsChannel?.parentId ?? null;
+
+  const channel = await guild.channels.create({
+    name: 'ban-logs',
+    type: ChannelType.GuildText,
+    topic: 'Every ban logged with /log-ban.',
+    ...(parentId
+      ? { parent: parentId }
+      : {
+          permissionOverwrites: [
+            { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+            {
+              id: client.user.id,
+              allow: [
+                PermissionFlagsBits.ViewChannel,
+                PermissionFlagsBits.SendMessages,
+                PermissionFlagsBits.EmbedLinks,
+              ],
+            },
+          ],
+        }),
+  });
+
+  cfg.banLogChannelId = channel.id;
+  save();
+  return channel;
+}
+
+async function handleModRole(interaction) {
+  const cfg = db.guilds[interaction.guildId];
+  if (!cfg) return replyEmbed(interaction, 'Run `/setup` first so the ticket channels exist.', COLORS.error);
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const role = interaction.options.getRole('role', true);
+
+  // The mod role can read the ban log (but not post in it, only the bot does)
+  const banChannel = await ensureBanLogChannel(interaction.guild);
+  await banChannel.permissionOverwrites.edit(role, {
+    ViewChannel: true,
+    ReadMessageHistory: true,
+  });
+
+  cfg.modRoleId = role.id;
+  save();
+
+  await interaction.editReply({
+    embeds: [
+      embed(`${role} can now use \`/log-ban\` and read ${banChannel}.`, {
+        title: 'Mod role set',
+        color: COLORS.ok,
+      }),
+    ],
+  });
+}
+
+async function handleLogBan(interaction) {
+  if (!db.guilds[interaction.guildId]) {
+    return replyEmbed(interaction, 'Run `/setup` first so I can create the ban log channel.', COLORS.error);
+  }
+
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  // Strip backticks so the username can't break out of its code formatting
+  const username = interaction.options.getString('username', true).trim().replace(/`/g, "'");
+  const length = interaction.options.getString('length', true).trim();
+  const reason = interaction.options.getString('reason', true).trim();
+
+  const banChannel = await ensureBanLogChannel(interaction.guild);
+  await banChannel.send({
+    embeds: [
+      embed(null, {
+        title: 'Ban logged',
+        color: COLORS.closed,
+        fields: [
+          { name: 'Username', value: `\`${username}\``, inline: true },
+          { name: 'Length', value: length.slice(0, 1024), inline: true },
+          { name: 'Logged by', value: `${interaction.user}`, inline: true },
+          { name: 'Reason', value: reason.slice(0, 1024) },
+        ],
+      }),
+    ],
+  });
+
+  await interaction.editReply({
+    embeds: [embed(`Ban for \`${username}\` logged in ${banChannel}.`, { color: COLORS.ok })],
+  });
 }
 
 /* ------------------------- message relay ------------------------------ */
